@@ -1,0 +1,513 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 67c7a9d6..9f42482e 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -51,7 +51,6 @@ members = [
+ 
+ exclude = [
+   "build",
+-  "compiler/rustc_codegen_cranelift",
+   "compiler/rustc_codegen_gcc",
+   "src/bootstrap",
+   "tests/rustdoc-gui",
+diff --git a/compiler/rustc/Cargo.toml b/compiler/rustc/Cargo.toml
+index 8cef9e06..f133bcab 100644
+--- a/compiler/rustc/Cargo.toml
++++ b/compiler/rustc/Cargo.toml
+@@ -8,13 +8,15 @@ edition = "2024"
+ 
+ # Make sure rustc_codegen_ssa ends up in the sysroot, because this
+ # crate is intended to be used by codegen backends, which may not be in-tree.
+-rustc_codegen_ssa = { path = "../rustc_codegen_ssa" }
++rustc_codegen_ssa = { path = "../rustc_codegen_ssa", features = ["embedded_wild"] }
+ 
+ rustc_driver = { path = "../rustc_driver" }
+-rustc_driver_impl = { path = "../rustc_driver_impl" }
++rustc_driver_impl = { path = "../rustc_driver_impl", features = ["cranelift"] }
+ 
+ rustc_public = { path = "../rustc_public" }
+ 
++libwild = { version = "0.9.0", default-features = false, features = ["fork"] }
++
+ # Make sure rustc_public_bridge ends up in the sysroot, because this
+ # crate is intended to be used by stable MIR consumers, which are not in-tree.
+ rustc_public_bridge = { path = "../rustc_public_bridge" }
+@@ -34,7 +36,11 @@ features = ['override_allocator_on_supported_platforms']
+ 
+ [features]
+ # tidy-alphabetical-start
++default = ["embedded_wild", "musl_static"]
+ check_only = ['rustc_driver_impl/check_only']
++cranelift = ['rustc_driver_impl/cranelift']
++embedded_wild = ['rustc_codegen_ssa/embedded_wild']
++musl_static = []
+ jemalloc = ['dep:tikv-jemalloc-sys']
+ llvm = ['rustc_driver_impl/llvm']
+ llvm_enzyme = ['rustc_driver_impl/llvm_enzyme']
+diff --git a/compiler/rustc/src/main.rs b/compiler/rustc/src/main.rs
+index 30d64b05..14ad6192 100644
+--- a/compiler/rustc/src/main.rs
++++ b/compiler/rustc/src/main.rs
+@@ -41,5 +41,36 @@
+ use tikv_jemalloc_sys as _;
+ 
+ fn main() -> ExitCode {
++    #[cfg(feature = "embedded_wild")]
++    if std::env::var_os("LERUSTC_AS_LINKER").is_some() {
++        return run_wild();
++    }
++
+     rustc_driver::main()
+ }
++
++#[cfg(feature = "embedded_wild")]
++fn run_wild() -> ExitCode {
++    if let Err(error) = run_wild_inner() {
++        libwild::error::report_error_and_exit(&error);
++    }
++    ExitCode::SUCCESS
++}
++
++#[cfg(feature = "embedded_wild")]
++fn run_wild_inner() -> libwild::error::Result<()> {
++    libwild::init_timing()?;
++
++    let mut args = libwild::Args::new(|| std::env::args())?;
++    args.parse(|| std::env::args())?;
++
++    if libwild::should_fork(&args) {
++        // Safety: We haven't spawned any threads yet.
++        unsafe { libwild::run_in_subprocess(args) };
++    } else {
++        libwild::setup_tracing(&args)?;
++        libwild::run(args)?;
++    }
++
++    Ok(())
++}
+diff --git a/compiler/rustc_codegen_cranelift/Cargo.toml b/compiler/rustc_codegen_cranelift/Cargo.toml
+index 17ddbada..ddb9f5c2 100644
+--- a/compiler/rustc_codegen_cranelift/Cargo.toml
++++ b/compiler/rustc_codegen_cranelift/Cargo.toml
+@@ -3,9 +3,6 @@ name = "rustc_codegen_cranelift"
+ version = "0.1.0"
+ edition = "2024"
+ 
+-[lib]
+-crate-type = ["dylib"]
+-
+ [dependencies]
+ # These have to be in sync with each other
+ cranelift-codegen = { version = "0.132.0", default-features = false, features = ["std", "timing", "unwind", "all-native-arch"] }
+@@ -22,6 +19,21 @@ indexmap = "2.0.0"
+ libloading = { version = "0.9.0", optional = true }
+ smallvec = "1.8.1"
+ 
++rustc_abi = { path = "../rustc_abi" }
++rustc_ast = { path = "../rustc_ast" }
++rustc_codegen_ssa = { path = "../rustc_codegen_ssa" }
++rustc_const_eval = { path = "../rustc_const_eval" }
++rustc_data_structures = { path = "../rustc_data_structures" }
++rustc_errors = { path = "../rustc_errors" }
++rustc_hir = { path = "../rustc_hir" }
++rustc_index = { path = "../rustc_index" }
++rustc_log = { path = "../rustc_log" }
++rustc_middle = { path = "../rustc_middle" }
++rustc_session = { path = "../rustc_session" }
++rustc_span = { path = "../rustc_span" }
++rustc_symbol_mangling = { path = "../rustc_symbol_mangling" }
++rustc_target = { path = "../rustc_target" }
++
+ # Uncomment to use an unreleased version of cranelift
+ #[patch.crates-io]
+ #cranelift-codegen = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "release-45.0.0" }
+@@ -47,6 +59,8 @@ unstable-features = ["jit", "inline_asm_sym"]
+ jit = ["cranelift-jit", "libloading"]
+ inline_asm_sym = []
+ unwinding = [] # Not yet included in unstable-features for performance reasons
++# Stub features so bootstrap can build this crate alongside rustc when linked in-tree.
++max_level_info = []
+ 
+ [package.metadata.rust-analyzer]
+ rustc_private = true
+diff --git a/compiler/rustc_codegen_cranelift/src/lib.rs b/compiler/rustc_codegen_cranelift/src/lib.rs
+index af783f31..80383398 100644
+--- a/compiler/rustc_codegen_cranelift/src/lib.rs
++++ b/compiler/rustc_codegen_cranelift/src/lib.rs
+@@ -8,27 +8,12 @@
+ #![warn(rust_2018_idioms)]
+ #![warn(unreachable_pub)]
+ #![warn(unused_lifetimes)]
++// cg_clif predates the symbol-intern-string-literal lint.
++#![allow(rustc::symbol_intern_string_literal)]
+ // tidy-alphabetical-end
+ 
+ #[macro_use]
+ extern crate rustc_middle;
+-extern crate rustc_abi;
+-extern crate rustc_ast;
+-extern crate rustc_codegen_ssa;
+-extern crate rustc_const_eval;
+-extern crate rustc_data_structures;
+-extern crate rustc_errors;
+-extern crate rustc_hir;
+-extern crate rustc_index;
+-extern crate rustc_log;
+-extern crate rustc_session;
+-extern crate rustc_span;
+-extern crate rustc_symbol_mangling;
+-extern crate rustc_target;
+-
+-// This prevents duplicating functions and statics that are already part of the host rustc process.
+-#[allow(unused_extern_crates)]
+-extern crate rustc_driver;
+ 
+ use std::any::Any;
+ use std::cell::OnceCell;
+@@ -120,6 +105,12 @@ pub struct CraneliftCodegenBackend {
+     pub config: OnceCell<BackendConfig>,
+ }
+ 
++impl CraneliftCodegenBackend {
++    pub fn new() -> Box<dyn CodegenBackend> {
++        Box::new(CraneliftCodegenBackend { config: OnceCell::new() })
++    }
++}
++
+ impl CodegenBackend for CraneliftCodegenBackend {
+     fn name(&self) -> &'static str {
+         "cranelift"
+diff --git a/compiler/rustc_codegen_cranelift/src/toolchain.rs b/compiler/rustc_codegen_cranelift/src/toolchain.rs
+index b6b465e1..9abb91e3 100644
+--- a/compiler/rustc_codegen_cranelift/src/toolchain.rs
++++ b/compiler/rustc_codegen_cranelift/src/toolchain.rs
+@@ -25,5 +25,16 @@ pub(crate) fn get_toolchain_binary(sess: &Session, tool: &str) -> PathBuf {
+         linker.set_file_name(tool_file_name)
+     }
+ 
++    if !linker.exists() && tool == "as" {
++        if let Ok(path) = std::process::Command::new("which").arg("as").output() {
++            if path.status.success() {
++                let as_path = String::from_utf8_lossy(&path.stdout).trim().to_string();
++                if !as_path.is_empty() {
++                    return PathBuf::from(as_path);
++                }
++            }
++        }
++    }
++
+     linker
+ }
+diff --git a/compiler/rustc_codegen_ssa/Cargo.toml b/compiler/rustc_codegen_ssa/Cargo.toml
+index c7d7b742..9a485979 100644
+--- a/compiler/rustc_codegen_ssa/Cargo.toml
++++ b/compiler/rustc_codegen_ssa/Cargo.toml
+@@ -54,3 +54,6 @@ features = ["read_core", "elf", "macho", "pe", "xcoff", "unaligned", "archive",
+ [target.'cfg(windows)'.dependencies.windows]
+ version = "0.61.0"
+ features = ["Win32_Globalization"]
++
++[features]
++embedded_wild = []
+diff --git a/compiler/rustc_codegen_ssa/src/back/link.rs b/compiler/rustc_codegen_ssa/src/back/link.rs
+index c68220ae..46ac92ef 100644
+--- a/compiler/rustc_codegen_ssa/src/back/link.rs
++++ b/compiler/rustc_codegen_ssa/src/back/link.rs
+@@ -958,6 +958,13 @@ fn link_natively(
+ 
+     linker::disable_localization(&mut cmd);
+ 
++    #[cfg(feature = "embedded_wild")]
++    if let Ok(exe) = std::env::current_exe() {
++        if linker_path == exe {
++            cmd.env("LERUSTC_AS_LINKER", "1");
++        }
++    }
++
+     for (k, v) in sess.target.link_env.as_ref() {
+         cmd.env(k.as_ref(), v.as_ref());
+     }
+@@ -1624,6 +1631,13 @@ fn adjust_flavor_to_features(
+         return ret;
+     }
+ 
++    #[cfg(feature = "embedded_wild")]
++    if sess.opts.cg.linker.is_none() && sess.target.linker.is_none() {
++        if let Ok(exe) = std::env::current_exe() {
++            return (exe, LinkerFlavor::Gnu(Cc::No, Lld::No));
++        }
++    }
++
+     bug!("Not enough information provided to determine how to invoke the linker");
+ }
+ 
+diff --git a/compiler/rustc_driver/Cargo.toml b/compiler/rustc_driver/Cargo.toml
+index 51909719..a20bcf45 100644
+--- a/compiler/rustc_driver/Cargo.toml
++++ b/compiler/rustc_driver/Cargo.toml
+@@ -3,9 +3,6 @@ name = "rustc_driver"
+ version = "0.0.0"
+ edition = "2024"
+ 
+-[lib]
+-crate-type = ["dylib"]
+-
+ [dependencies]
+ # tidy-alphabetical-start
+ rustc_driver_impl = { path = "../rustc_driver_impl" }
+diff --git a/compiler/rustc_driver_impl/Cargo.toml b/compiler/rustc_driver_impl/Cargo.toml
+index aeb2063e..93702f7b 100644
+--- a/compiler/rustc_driver_impl/Cargo.toml
++++ b/compiler/rustc_driver_impl/Cargo.toml
+@@ -57,6 +57,7 @@ ctrlc = "3.4.4"
+ [features]
+ # tidy-alphabetical-start
+ check_only = ['rustc_interface/check_only']
++cranelift = ['rustc_interface/cranelift']
+ llvm = ['rustc_interface/llvm']
+ llvm_enzyme = ['rustc_interface/llvm_enzyme']
+ llvm_offload = ['rustc_interface/llvm_offload']
+diff --git a/compiler/rustc_interface/Cargo.toml b/compiler/rustc_interface/Cargo.toml
+index 9c115736..3bd60cec 100644
+--- a/compiler/rustc_interface/Cargo.toml
++++ b/compiler/rustc_interface/Cargo.toml
+@@ -14,6 +14,7 @@ rustc_attr_parsing = { path = "../rustc_attr_parsing" }
+ rustc_borrowck = { path = "../rustc_borrowck" }
+ rustc_builtin_macros = { path = "../rustc_builtin_macros" }
+ rustc_codegen_llvm = { path = "../rustc_codegen_llvm", optional = true }
++rustc_codegen_cranelift = { path = "../rustc_codegen_cranelift", optional = true }
+ rustc_codegen_ssa = { path = "../rustc_codegen_ssa" }
+ rustc_const_eval = { path = "../rustc_const_eval" }
+ rustc_data_structures = { path = "../rustc_data_structures" }
+@@ -56,6 +57,7 @@ rustc_abi = { path = "../rustc_abi" }
+ [features]
+ # tidy-alphabetical-start
+ check_only = ['rustc_codegen_llvm?/check_only']
++cranelift = ['dep:rustc_codegen_cranelift']
+ llvm = ['dep:rustc_codegen_llvm']
+ llvm_enzyme = ['rustc_builtin_macros/llvm_enzyme', 'rustc_codegen_llvm/llvm_enzyme']
+ llvm_offload = ['rustc_codegen_llvm/llvm_offload']
+diff --git a/compiler/rustc_interface/src/util.rs b/compiler/rustc_interface/src/util.rs
+index 6e74ec64..5db7d17f 100644
+--- a/compiler/rustc_interface/src/util.rs
++++ b/compiler/rustc_interface/src/util.rs
+@@ -348,6 +348,8 @@ pub fn get_codegen_backend(
+             "dummy" => || Box::new(DummyCodegenBackend { target_config_override: None }),
+             #[cfg(feature = "llvm")]
+             "llvm" => rustc_codegen_llvm::LlvmCodegenBackend::new,
++            #[cfg(feature = "cranelift")]
++            "cranelift" => rustc_codegen_cranelift::CraneliftCodegenBackend::new,
+             backend_name => get_codegen_sysroot(early_dcx, sysroot, backend_name),
+         }
+     });
+diff --git a/compiler/rustc_session/src/filesearch.rs b/compiler/rustc_session/src/filesearch.rs
+index bf1e1f5f..0ddecb6c 100644
+--- a/compiler/rustc_session/src/filesearch.rs
++++ b/compiler/rustc_session/src/filesearch.rs
+@@ -187,6 +187,14 @@ fn current_dll_path() -> Result<PathBuf, String> {
+ /// This function checks if sysroot is found using env::args().next(), and if it
+ /// is not found, finds sysroot from current rustc_driver dll.
+ pub(crate) fn default_sysroot() -> PathBuf {
++    fn sysroot_from_current_exe() -> Option<PathBuf> {
++        let mut p = std::env::current_exe().ok()?;
++        p.pop(); // bin/
++        p.pop(); // sysroot
++        let rustlib = p.join("lib").join("rustlib");
++        rustlib.exists().then_some(p)
++    }
++
+     fn default_from_rustc_driver_dll() -> Result<PathBuf, String> {
+         let dll = current_dll_path()?;
+ 
+@@ -251,6 +259,7 @@ fn from_env_args_next() -> Option<PathBuf> {
+         rustlib_path.exists().then_some(p)
+     }
+ 
+-    from_env_args_next()
++    sysroot_from_current_exe()
++        .or(from_env_args_next())
+         .unwrap_or_else(|| default_from_rustc_driver_dll().expect("Failed finding sysroot"))
+ }
+diff --git a/src/bootstrap/src/bin/rustc.rs b/src/bootstrap/src/bin/rustc.rs
+index bb974e46..a00de794 100644
+--- a/src/bootstrap/src/bin/rustc.rs
++++ b/src/bootstrap/src/bin/rustc.rs
+@@ -16,6 +16,7 @@
+ //! never get replaced.
+ 
+ use std::env;
++use std::ffi::OsString;
+ use std::path::{Path, PathBuf};
+ use std::process::{Child, Command};
+ use std::time::Instant;
+@@ -31,6 +32,45 @@
+ #[path = "../utils/proc_macro_deps.rs"]
+ mod proc_macro_deps;
+ 
++fn lerustc_musl_linker() -> Option<String> {
++    if let Ok(linker) = env::var("LERUSTC_MUSL_LINKER") {
++        if !linker.is_empty() {
++            return Some(linker);
++        }
++    }
++
++    for candidate in [
++        "/usr/bin/x86_64-linux-musl-gcc",
++        "/usr/bin/musl-gcc",
++        "/usr/local/musl/bin/musl-gcc",
++    ] {
++        if Path::new(candidate).exists() {
++            return Some(candidate.to_string());
++        }
++    }
++
++    if let Ok(output) = Command::new("which").arg("musl-gcc").output() {
++        if output.status.success() {
++            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
++            if !path.is_empty() {
++                return Some(path);
++            }
++        }
++    }
++
++    None
++}
++
++fn lerustc_is_musl_host_build(args: &[OsString]) -> bool {
++    if let Ok(host) = env::var("CFG_COMPILER_HOST_TRIPLE") {
++        if host.contains("musl") {
++            return true;
++        }
++    }
++    parse_value_from_args(args, "--target")
++        .is_some_and(|target| target.contains("musl"))
++}
++
+ fn main() {
+     let orig_args = env::args_os().skip(1).collect::<Vec<_>>();
+     let mut args = orig_args.clone();
+@@ -143,6 +183,22 @@ fn main() {
+         cmd.arg("-Z").arg("on-broken-pipe=kill");
+     }
+ 
++    let crate_type = parse_value_from_args(&orig_args, "--crate-type");
++
++    // lerustc: fully static rustc-main linked against musl (musl-host compiler only).
++    if env::var_os("LERUSTC").is_some()
++        && lerustc_is_musl_host_build(&orig_args)
++        && (crate_name == Some("rustc-main") || crate_name == Some("rustc_main"))
++        && crate_type == Some("bin")
++    {
++        cmd.arg("-Ctarget-feature=+crt-static");
++        cmd.arg("-Crelocation-model=static");
++        cmd.arg("-Clink-arg=-static");
++        if let Some(linker) = lerustc_musl_linker() {
++            cmd.arg(format!("-Clinker={linker}"));
++        }
++    }
++
+     if target.is_some() {
+         // The stage0 compiler has a special sysroot distinct from what we
+         // actually downloaded, so we just always pass the `--sysroot` option,
+@@ -151,9 +207,6 @@ fn main() {
+             cmd.arg("--sysroot").arg(&sysroot);
+         }
+ 
+-        let crate_type = parse_value_from_args(&orig_args, "--crate-type");
+-        // `-Ztls-model=initial-exec` must not be applied to proc-macros, see
+-        // issue https://github.com/rust-lang/rust/issues/100530
+         if env::var("RUSTC_TLS_MODEL_INITIAL_EXEC").is_ok()
+             && crate_type != Some("proc-macro")
+             && proc_macro_deps::CRATES.binary_search(&crate_name.unwrap_or_default()).is_err()
+diff --git a/src/bootstrap/src/core/build_steps/compile.rs b/src/bootstrap/src/core/build_steps/compile.rs
+index 3b497e1d..c08c13fc 100644
+--- a/src/bootstrap/src/core/build_steps/compile.rs
++++ b/src/bootstrap/src/core/build_steps/compile.rs
+@@ -1149,11 +1149,11 @@ fn run(self, builder: &Builder<'_>) -> Self::Output {
+         // NB: all RUSTFLAGS should be added to `rustc_cargo()` so they will be
+         // consistently applied by check/doc/test modes too.
+ 
+-        for krate in &*self.crates {
+-            cargo.arg("-p").arg(krate);
+-        }
++    for krate in &*self.crates {
++        cargo.arg("-p").arg(krate);
++    }
+ 
+-        if builder.build.config.enable_bolt_settings && build_compiler.stage == 1 {
++    if builder.build.config.enable_bolt_settings && build_compiler.stage == 1 {
+             // Relocations are required for BOLT to work.
+             cargo.env("RUSTC_BOLT_LINK_FLAGS", "1");
+         }
+@@ -1200,7 +1200,9 @@ fn run(self, builder: &Builder<'_>) -> Self::Output {
+             && builder.config.rust_debuginfo_level_tools == DebuginfoLevel::None
+         {
+             let rustc_driver = target_root_dir.join("librustc_driver.so");
+-            strip_debug(builder, target, &rustc_driver);
++            if rustc_driver.exists() {
++                strip_debug(builder, target, &rustc_driver);
++            }
+         }
+ 
+         if builder.config.rust_debuginfo_level_rustc == DebuginfoLevel::None {
+@@ -1373,6 +1375,14 @@ pub fn rustc_cargo_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetS
+         cargo.env("CFG_DISABLE_UNSTABLE_FEATURES", "1");
+     }
+ 
++    if std::env::var_os("LERUSTC").is_some() {
++        cargo.env("LERUSTC", "1");
++        // musl-gcc + dynamic proc-macro dylibs need libgcc_s from the gnu multilib path.
++        if target.contains("musl") {
++            cargo.rustflag("-Clink-arg=-L/usr/lib/x86_64-linux-gnu");
++        }
++    }
++
+     // Prefer the current target's own default_linker, else a globally
+     // specified one.
+     if let Some(s) = target_config.and_then(|c| c.default_linker.as_ref()) {
+@@ -2290,8 +2300,16 @@ fn run(self, builder: &Builder<'_>) -> Compiler {
+             target_compiler.stage - 1,
+             builder.config.host_target,
+         );
+-        let build_compiler =
+-            builder.compiler(target_compiler.stage - 1, builder.config.host_target);
++        let build_compiler = if std::env::var_os("LERUSTC").is_some()
++            && target_compiler.stage == 1
++            && target_compiler.host.contains("musl")
++            && target_compiler.host != builder.config.host_target
++        {
++            // Cross-host musl stage1: use the gnu stage1 compiler (musl std already built).
++            builder.compiler(1, builder.config.host_target)
++        } else {
++            builder.compiler(target_compiler.stage - 1, builder.config.host_target)
++        };
+ 
+         // Build enzyme
+         if builder.config.llvm_enzyme {
+@@ -2426,6 +2444,9 @@ fn run(self, builder: &Builder<'_>) -> Compiler {
+ 
+                 match backend {
+                     CodegenBackendKind::Cranelift => {
++                        if std::env::var_os("LERUSTC").is_some() {
++                            continue;
++                        }
+                         let stamp = builder
+                             .ensure(CraneliftCodegenBackend { compilers: prepare_compilers() });
+                         copy_codegen_backends_to_sysroot(builder, stamp, target_compiler);
+diff --git a/src/bootstrap/src/lib.rs b/src/bootstrap/src/lib.rs
+index fd3e88e1..3433b85a 100644
+--- a/src/bootstrap/src/lib.rs
++++ b/src/bootstrap/src/lib.rs
+@@ -1731,6 +1731,12 @@ fn in_tree_crates(&self, root: &str, target: Option<TargetSelection>) -> Vec<&Cr
+                             .unwrap_or_else(|| self.config.any_profiler_enabled()))
+                     && (dep != "rustc_codegen_llvm"
+                         || self.config.hosts.iter().any(|host| self.config.llvm_enabled(*host)))
++                    && (dep != "rustc_codegen_cranelift"
++                        || std::env::var_os("LERUSTC").is_some()
++                        || self.config.hosts.iter().any(|host| {
++                            self.config.enabled_codegen_backends(*host)
++                                .contains(&CodegenBackendKind::Cranelift)
++                        }))
+                 {
+                     list.push(dep.clone());
+                 }

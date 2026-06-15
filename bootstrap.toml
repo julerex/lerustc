@@ -1,0 +1,30 @@
+# lerustc bootstrap configuration — copied to rust/config.toml by build.sh
+change-id = 999999
+
+[build]
+# Native build machine (stage0 paths, build/ layout).
+build = "x86_64-unknown-linux-gnu"
+# Stage1 gnu compiler cross-compiles musl std; stage1 musl rustc is what we ship.
+host = ["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]
+target = ["x86_64-unknown-linux-musl"]
+full-bootstrap = true
+extended = false
+# Use the prebuilt beta compiler from rustup for stage0.
+# Requires: rustup toolchain install beta
+
+[rust]
+channel = "nightly"
+# Cranelift only — no LLVM download or build.
+codegen-backends = ["cranelift"]
+llvm-tools = false
+jemalloc = false
+
+[llvm]
+# Download prebuilt LLVM for compiler-rt/libunwind (std build); avoids a multi-hour source build.
+download-ci-llvm = true
+
+[target.x86_64-unknown-linux-musl]
+musl-root = "/usr"
+musl-libdir = "/usr/lib/x86_64-linux-musl"
+cc = "/usr/bin/musl-gcc"
+cxx = "/usr/bin/musl-gcc"
